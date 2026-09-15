@@ -203,6 +203,14 @@ MaybeError SwapChainEGL::CreateEGLSurface(const DisplayEGL* display) {
     // constraints.
     auto TryCreateSurface = [&]() -> MaybeError {
         switch (surface->GetType()) {
+            case Surface::Type::EGLNativeWindow:
+                // The application hands over an EGLNativeWindowType for the display's platform
+                // (a gbm_surface on DRM/GBM, for instance) with no window system in between.
+                mEGLSurface = egl.CreateWindowSurface(
+                    eglDisplay, config,
+                    reinterpret_cast<EGLNativeWindowType>(surface->GetEGLNativeWindow()),
+                    attribs.data());
+                return {};
 #if DAWN_PLATFORM_IS(ANDROID)
             case Surface::Type::AndroidWindow:
                 mEGLSurface = egl.CreateWindowSurface(

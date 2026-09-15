@@ -64,6 +64,9 @@ absl::FormatConvertResult<absl::FormatConversionCharSet::kString> AbslFormatConv
         case Surface::Type::AndroidWindow:
             s->Append("AndroidWindow");
             break;
+        case Surface::Type::EGLNativeWindow:
+            s->Append("EGLNativeWindow");
+            break;
         case Surface::Type::MetalLayer:
             s->Append("MetalLayer");
             break;
@@ -115,13 +118,20 @@ ResultOrError<UnpackedPtr<SurfaceDescriptor>> ValidateSurfaceDescriptor(
     wgpu::SType type;
     DAWN_TRY_ASSIGN(
         type, (descriptor.ValidateBranches<
-                  Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
-                  Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                  Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceEGLNativeWindow>,
+                  Branch<SurfaceSourceMetalLayer>, Branch<SurfaceSourceWindowsHWND>,
+                  Branch<SurfaceDescriptorFromWindowsCoreWindow>,
                   Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
                   Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
                   Branch<SurfaceSourceSwitchNWindow>,
                   Branch<SurfaceSourceXlibWindow>, Branch<SurfaceSourceWaylandSurface>>()));
     switch (type) {
+        case wgpu::SType::SurfaceSourceEGLNativeWindow: {
+            auto* subDesc = descriptor.Get<SurfaceSourceEGLNativeWindow>();
+            DAWN_ASSERT(subDesc != nullptr);
+            DAWN_INVALID_IF(subDesc->window == nullptr, "EGL native window is nullptr.");
+            return descriptor;
+        }
 #if DAWN_PLATFORM_IS(ANDROID)
         case wgpu::SType::SurfaceSourceAndroidNativeWindow: {
             auto* subDesc = descriptor.Get<SurfaceSourceAndroidNativeWindow>();
@@ -312,8 +322,9 @@ Surface::Surface(InstanceBase* instance, const UnpackedPtr<SurfaceDescriptor>& d
     wgpu::SType type =
         descriptor
             .ValidateBranches<
-                Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceMetalLayer>,
-                Branch<SurfaceSourceWindowsHWND>, Branch<SurfaceDescriptorFromWindowsCoreWindow>,
+                Branch<SurfaceSourceAndroidNativeWindow>, Branch<SurfaceSourceEGLNativeWindow>,
+                Branch<SurfaceSourceMetalLayer>, Branch<SurfaceSourceWindowsHWND>,
+                Branch<SurfaceDescriptorFromWindowsCoreWindow>,
                 Branch<SurfaceDescriptorFromWindowsUWPSwapChainPanel>,
                 Branch<SurfaceDescriptorFromWindowsWinUISwapChainPanel>,
                 Branch<SurfaceSourceSwitchNWindow>,
@@ -324,6 +335,12 @@ Surface::Surface(InstanceBase* instance, const UnpackedPtr<SurfaceDescriptor>& d
             auto* subDesc = descriptor.Get<SurfaceSourceAndroidNativeWindow>();
             mType = Type::AndroidWindow;
             mAndroidNativeWindow = subDesc->window;
+            break;
+        }
+        case wgpu::SType::SurfaceSourceEGLNativeWindow: {
+            auto* subDesc = descriptor.Get<SurfaceSourceEGLNativeWindow>();
+            mType = Type::EGLNativeWindow;
+            mEGLNativeWindow = subDesc->window;
             break;
         }
         case wgpu::SType::SurfaceSourceMetalLayer: {
@@ -412,6 +429,12 @@ void* Surface::GetAndroidNativeWindow() const {
     DAWN_CHECK(!IsError());
     DAWN_CHECK(mType == Type::AndroidWindow);
     return mAndroidNativeWindow;
+}
+
+void* Surface::GetEGLNativeWindow() const {
+    DAWN_CHECK(!IsError());
+    DAWN_CHECK(mType == Type::EGLNativeWindow);
+    return mEGLNativeWindow;
 }
 
 void* Surface::GetMetalLayer() const {

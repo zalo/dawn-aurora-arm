@@ -78,6 +78,7 @@ class Surface final : public ErrorMonad {
     enum class Type {
         Undefined,
         AndroidWindow,
+        EGLNativeWindow,
         MetalLayer,
         WaylandSurface,
         WindowsHWND,
@@ -96,6 +97,9 @@ class Surface final : public ErrorMonad {
 
     // Valid to call if the type is Android
     void* GetAndroidNativeWindow() const;
+
+    // Valid to call if the type is EGLNativeWindow
+    void* GetEGLNativeWindow() const;
 
     // Valid to call if the type is WaylandSurface
     void* GetWaylandDisplay() const;
@@ -163,6 +167,9 @@ class Surface final : public ErrorMonad {
 
     // ANativeWindow
     raw_ptr<void> mAndroidNativeWindow = nullptr;
+
+    // EGLNativeWindowType
+    raw_ptr<void> mEGLNativeWindow = nullptr;
 
     // NWindow
     raw_ptr<void> mSwitchNWindow = nullptr;

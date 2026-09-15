@@ -3962,6 +3962,15 @@
             {"name": "window", "type": "void *"}
         ]
     },
+    "surface source EGL native window": {
+        "category": "structure",
+        "chained": "in",
+        "chain roots": ["surface descriptor"],
+        "tags": ["dawn", "native"],
+        "members": [
+            {"name": "window", "type": "void *"}
+        ]
+    },
     "emscripten surface source canvas HTML selector": {
         "category": "structure",
         "chained": "in",
@@ -4193,7 +4202,8 @@
             {"value": 78, "name": "shared texture memory D3D12 resource descriptor", "tags": ["dawn", "native"]},
             {"value": 79, "name": "request adapter options angle virtualization group", "tags": ["dawn", "native"]},
             {"value": 80, "name": "pipeline layout resource table", "tags": ["dawn"]},
-            {"value": 81, "name": "adapter properties drm", "tags": ["dawn", "native"]}
+            {"value": 81, "name": "adapter properties drm", "tags": ["dawn", "native"]},
+            {"value": 82, "name": "surface source EGL native window", "tags": ["dawn", "native"]}
         ]
     },
     "texture": {
