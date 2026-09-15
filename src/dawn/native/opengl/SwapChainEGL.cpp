@@ -29,6 +29,7 @@
 
 #include <utility>
 
+#include "src/dawn/native/ChainUtils.h"
 #include "src/dawn/native/Surface.h"
 #include "src/dawn/native/opengl/ContextEGL.h"
 #include "src/dawn/native/opengl/DeviceGL.h"
@@ -79,6 +80,19 @@ MaybeError SwapChainEGL::Initialize(SwapChainBase* previousSwapChain) {
             SwapChainEGL* previousEGLSwapChain =
                 reinterpret_cast<SwapChainEGL*>(ToBackend(previousSwapChain));
             std::swap(previousEGLSwapChain->mEGLSurface, mEGLSurface);
+
+            // The GL textures behind the swapchain textures can be reused too when the textures
+            // they will back are identical. They belong to the previous swapchain's GL context,
+            // so the device must be the same. The one a current texture may be rendering into is
+            // out of its slot and stays with that texture.
+            if (previousSwapChain->GetDevice() == GetDevice() &&
+                previousSwapChain->GetWidth() == GetWidth() &&
+                previousSwapChain->GetHeight() == GetHeight() &&
+                previousSwapChain->GetUsage() == GetUsage() &&
+                previousSwapChain->GetViewFormats() == GetViewFormats()) {
+                std::swap(previousEGLSwapChain->mBackingTextures, mBackingTextures);
+                mNextBackingTexture = previousEGLSwapChain->mNextBackingTexture;
+            }
         }
 
         previousSwapChain->DetachFromSurface();
@@ -134,18 +148,37 @@ MaybeError SwapChainEGL::PresentImpl() {
         DAWN_TRY(scopedCurrentContext.End());
     }
 
+    // WebGPU requires the texture to be destroyed by Present, but its GL storage goes back into
+    // its slot of the ring for a later frame's texture (see GetCurrentTextureImpl).
+    DAWN_ASSERT(mBackingTextures[mCurrentBackingTexture] == 0);
+    mBackingTextures[mCurrentBackingTexture] = mTexture->DetachHandle();
     mTexture->APIDestroy();
     mTexture = nullptr;
+    mTextureView = nullptr;
 
     return {};
 }
 
 ResultOrError<SwapChainTextureInfo> SwapChainEGL::GetCurrentTextureImpl() {
-    // Create the fake surface texture that we'll blit from.
+    // Create the fake surface texture that we'll blit from. A new Texture is required every frame
+    // (it starts uninitialized and is destroyed by Present, as WebGPU requires), but the GL
+    // texture a previous frame's texture was presented from is wrapped again instead of
+    // allocating new storage: that saves the allocation and keeps the framebuffers cached against
+    // it valid. The storages rotate through a small ring (see mBackingTextures) so that the
+    // texture rendered into now is not the one whose present blit may still be in flight.
     TextureDescriptor desc = GetSwapChainBaseTextureDescriptor(this);
     Ref<TextureBase> texture;
     Ref<TextureViewBase> view;
-    DAWN_TRY_ASSIGN(texture, GetDevice()->CreateTexture(&desc));
+    mCurrentBackingTexture = mNextBackingTexture;
+    mNextBackingTexture = (mNextBackingTexture + 1) % kBackingTextureCount;
+    GLuint& backingTexture = mBackingTextures[mCurrentBackingTexture];
+    if (backingTexture != 0) {
+        texture = AcquireRef(
+            new Texture(ToBackend(GetDevice()), Unpack(&desc), backingTexture, OwnsHandle::Yes));
+        backingTexture = 0;
+    } else {
+        DAWN_TRY_ASSIGN(texture, GetDevice()->CreateTexture(&desc));
+    }
     DAWN_TRY_ASSIGN(view, GetDevice()->CreateTextureView(texture.Get()));
 
     mTexture = std::move(ToBackend(texture));
@@ -166,9 +199,25 @@ void SwapChainEGL::DetachFromSurfaceImpl() {
     }
 
     if (mTexture != nullptr) {
+        // The current texture owns its GL texture and deletes it.
+        DAWN_ASSERT(mBackingTextures[mCurrentBackingTexture] == 0);
         mTexture->APIDestroy();
         mTexture = nullptr;
         mTextureView = nullptr;
+    }
+
+    Device* device = ToBackend(GetDevice());
+    for (GLuint& backingTexture : mBackingTextures) {
+        if (backingTexture == 0) {
+            continue;
+        }
+        IgnoreErrors(device->EnqueueGL(
+            [device, texture = backingTexture](const OpenGLFunctions& gl) -> MaybeError {
+                device->GetFramebufferCache()->RemoveTexture(gl, texture);
+                DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &texture));
+                return {};
+            }));
+        backingTexture = 0;
     }
 }
 

@@ -28,8 +28,12 @@
 #ifndef SRC_DAWN_NATIVE_OPENGL_SWAPCHAINEGL_H_
 #define SRC_DAWN_NATIVE_OPENGL_SWAPCHAINEGL_H_
 
+#include <array>
+#include <cstddef>
+
 #include "src/dawn/common/egl_platform.h"
 #include "src/dawn/native/SwapChain.h"
+#include "src/dawn/native/opengl/opengl_platform.h"
 
 namespace dawn::native::opengl {
 
@@ -55,6 +59,21 @@ class SwapChainEGL final : public SwapChainBase {
     MaybeError CreateEGLSurface(const DisplayEGL* display);
 
     EGLSurface mEGLSurface = EGL_NO_SURFACE;
+
+    // WebGPU requires a new texture from every GetCurrentTexture, and Present destroys it, but the
+    // GL texture behind it is detached first and kept here to be wrapped by a later frame's
+    // texture. A ring of storages, not one: the blit that presents texture N may still be
+    // executing on the GPU when the application renders into frame N+1's texture, and reusing a
+    // single storage makes every frame wait for the previous present (measured as a 3x longer
+    // wait for the display and a net slowdown on a Mali-G52 handheld). With three, a storage is
+    // only reused two presents later. Storages are allocated on first use, taken out of their slot
+    // (owned by the current Texture) while a frame renders into them, and deleted with their
+    // cached framebuffers on detach.
+    static constexpr size_t kBackingTextureCount = 3;
+    std::array<GLuint, kBackingTextureCount> mBackingTextures = {};
+    // The slot the next GetCurrentTexture takes from, and the one the current texture came from.
+    size_t mNextBackingTexture = 0;
+    size_t mCurrentBackingTexture = 0;
     Ref<Texture> mTexture;
     Ref<TextureView> mTextureView;
 

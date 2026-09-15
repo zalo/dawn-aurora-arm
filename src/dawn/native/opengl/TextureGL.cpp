@@ -354,8 +354,22 @@ bool Texture::IsRenderbuffer() const {
            GetFormat().HasDepthOrStencil();
 }
 
+GLuint Texture::DetachHandle() {
+    DAWN_ASSERT(mOwnsHandle == OwnsHandle::Yes && !IsRenderbuffer());
+    if (IsDestroyed()) {
+        return 0;
+    }
+    mOwnsHandle = OwnsHandle::No;
+    mHandleDetached = true;
+    return mTextureHandle;
+}
+
 void Texture::DestroyImpl(DestroyReason reason) {
     TextureBase::DestroyImpl(reason);
+    if (mHandleDetached) {
+        // The GL texture, and the framebuffers cached against it, now belong to the swapchain.
+        return;
+    }
     // Framebuffers cached against the GL object must go before it does. The lambdas run on the
     // device's GL context, where the cache lives; the device outlives its pending GL work.
     Device* device = ToBackend(GetDevice());
