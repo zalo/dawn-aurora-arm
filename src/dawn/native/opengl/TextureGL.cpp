@@ -356,24 +356,36 @@ bool Texture::IsRenderbuffer() const {
 
 void Texture::DestroyImpl(DestroyReason reason) {
     TextureBase::DestroyImpl(reason);
+    // Framebuffers cached against the GL object must go before it does. The lambdas run on the
+    // device's GL context, where the cache lives; the device outlives its pending GL work.
+    Device* device = ToBackend(GetDevice());
     if (mOwnsHandle == OwnsHandle::Yes) {
         if (IsRenderbuffer()) {
-            IgnoreErrors(ToBackend(GetDevice())
-                             ->EnqueueDestroyGL(
-                                 this, &Texture::GetRenderbufferHandle, reason,
-                                 [](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
-                                     DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteRenderbuffers(1, &handle));
-                                     return {};
-                                 }));
+            IgnoreErrors(device->EnqueueDestroyGL(
+                this, &Texture::GetRenderbufferHandle, reason,
+                [device](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
+                    device->GetFramebufferCache()->RemoveRenderbuffer(gl, handle);
+                    DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteRenderbuffers(1, &handle));
+                    return {};
+                }));
         } else {
-            IgnoreErrors(ToBackend(GetDevice())
-                             ->EnqueueDestroyGL(
-                                 this, &Texture::GetTextureHandle, reason,
-                                 [](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
-                                     DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
-                                     return {};
-                                 }));
+            IgnoreErrors(device->EnqueueDestroyGL(
+                this, &Texture::GetTextureHandle, reason,
+                [device](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
+                    device->GetFramebufferCache()->RemoveTexture(gl, handle);
+                    DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
+                    return {};
+                }));
         }
+    } else {
+        // The GL texture belongs to the application, which may delete it and reuse its name once
+        // Dawn stops using it. Cached framebuffers referencing it must not survive that.
+        IgnoreErrors(device->EnqueueDestroyGL(
+            this, &Texture::GetTextureHandle, reason,
+            [device](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
+                device->GetFramebufferCache()->RemoveTexture(gl, handle);
+                return {};
+            }));
     }
 }
 
@@ -738,13 +750,14 @@ TextureView::~TextureView() {}
 void TextureView::DestroyImpl(DestroyReason reason) {
     TextureViewBase::DestroyImpl(reason);
     if (mOwnsHandle == OwnsHandle::Yes) {
-        IgnoreErrors(
-            ToBackend(GetDevice())
-                ->EnqueueDestroyGL(this, &TextureView::GetTextureHandle, reason,
-                                   [](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
-                                       DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
-                                       return {};
-                                   }));
+        Device* device = ToBackend(GetDevice());
+        IgnoreErrors(device->EnqueueDestroyGL(
+            this, &TextureView::GetTextureHandle, reason,
+            [device](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
+                device->GetFramebufferCache()->RemoveTexture(gl, handle);
+                DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
+                return {};
+            }));
     }
 }
 
@@ -762,61 +775,59 @@ GLenum TextureView::GetGLTarget() const {
     return mTarget;
 }
 
+FramebufferAttachment TextureView::GetFramebufferAttachment(GLuint depthSlice) const {
+    DAWN_ASSERT(depthSlice <
+                static_cast<GLuint>(GetSingleSubresourceVirtualSize().depthOrArrayLayers));
+
+    const Texture* texture = ToBackend(GetTexture());
+    if (texture->IsRenderbuffer()) {
+        DAWN_ASSERT(GetDimension() == wgpu::TextureViewDimension::e2D);
+        DAWN_ASSERT(GetBaseMipLevel() == 0 && GetLevelCount() == 1);
+        DAWN_ASSERT(GetBaseArrayLayer() == 0 && GetLayerCount() == 1);
+        return {texture->GetRenderbufferHandle(), GL_RENDERBUFFER, 0, 0};
+    }
+
+    // Use the base texture where possible to minimize the amount of copying required on GLES.
+    bool useOwnView = GetFormat().format != texture->GetFormat().format &&
+                      !texture->GetFormat().HasDepthOrStencil();
+    if (useOwnView) {
+        // Use our own texture handle and target which points to a subset of the texture's
+        // subresources.
+        return {GetTextureHandle(), GetGLTarget(), 0, 0};
+    }
+
+    // Use the texture's handle and target, with the view's base mip level and base array layer.
+    // We have validated that the depthSlice in render pass's colorAttachments must be undefined
+    // for 2d RTVs, which value is set to 0. For 3d RTVs, the baseArrayLayer must be 0. So here
+    // we can simply use baseArrayLayer + depthSlice to specify the slice in RTVs without
+    // checking the view's dimension.
+    return {texture->GetTextureHandle(), texture->GetGLTarget(), GetBaseMipLevel(),
+            GetBaseArrayLayer() + depthSlice};
+}
+
 MaybeError TextureView::BindToFramebuffer(const OpenGLFunctions& gl,
                                           GLenum target,
                                           GLenum attachment,
                                           GLuint depthSlice,
                                           std::optional<uint32_t> passSampleCount) {
-    DAWN_ASSERT(depthSlice <
-                static_cast<GLuint>(GetSingleSubresourceVirtualSize().depthOrArrayLayers));
-
-    if (ToBackend(GetTexture())->IsRenderbuffer()) {
-        DAWN_ASSERT(GetDimension() == wgpu::TextureViewDimension::e2D);
-        DAWN_ASSERT(GetBaseMipLevel() == 0 && GetLevelCount() == 1);
-        DAWN_ASSERT(GetBaseArrayLayer() == 0 && GetLayerCount() == 1);
-
-        GLuint handle = ToBackend(GetTexture())->GetRenderbufferHandle();
-        DAWN_GL_TRY(gl, FramebufferRenderbuffer(target, attachment, GL_RENDERBUFFER, handle));
+    FramebufferAttachment fbAttachment = GetFramebufferAttachment(depthSlice);
+    if (fbAttachment.target == GL_RENDERBUFFER) {
+        DAWN_GL_TRY(
+            gl, FramebufferRenderbuffer(target, attachment, GL_RENDERBUFFER, fbAttachment.handle));
         return {};
     }
 
-    // Use the base texture where possible to minimize the amount of copying required on GLES.
-    bool useOwnView = GetFormat().format != GetTexture()->GetFormat().format &&
-                      !GetTexture()->GetFormat().HasDepthOrStencil();
-
-    GLenum textarget;
-    GLuint textureHandle, mipLevel, arrayLayer;
-    if (useOwnView) {
-        // Use our own texture handle and target which points to a subset of the texture's
-        // subresources.
-        textureHandle = GetTextureHandle();
-        textarget = GetGLTarget();
-        mipLevel = 0;
-        arrayLayer = 0;
-    } else {
-        // Use the texture's handle and target, with the view's base mip level and base array
-
-        textureHandle = ToBackend(GetTexture())->GetTextureHandle();
-        textarget = ToBackend(GetTexture())->GetGLTarget();
-        mipLevel = GetBaseMipLevel();
-        // We have validated that the depthSlice in render pass's colorAttachments must be undefined
-        // for 2d RTVs, which value is set to 0. For 3d RTVs, the baseArrayLayer must be 0. So here
-        // we can simply use baseArrayLayer + depthSlice to specify the slice in RTVs without
-        // checking the view's dimension.
-        arrayLayer = GetBaseArrayLayer() + depthSlice;
-    }
-
-    DAWN_ASSERT(textureHandle != 0);
+    DAWN_ASSERT(fbAttachment.handle != 0);
 
     if (passSampleCount.has_value() && passSampleCount.value() != GetTexture()->GetSampleCount()) {
-        DAWN_GL_TRY(gl,
-                    FramebufferTexture2DMultisampleEXT(target, attachment, textarget, textureHandle,
-                                                       mipLevel, *passSampleCount));
+        DAWN_GL_TRY(gl, FramebufferTexture2DMultisampleEXT(target, attachment, fbAttachment.target,
+                                                           fbAttachment.handle, fbAttachment.level,
+                                                           *passSampleCount));
         return {};
     }
 
-    return FramebufferTextureHelper(gl, textarget, target, attachment, textureHandle, mipLevel,
-                                    arrayLayer);
+    return FramebufferTextureHelper(gl, fbAttachment.target, target, attachment,
+                                    fbAttachment.handle, fbAttachment.level, fbAttachment.layer);
 }
 
 GLenum TextureView::GetInternalFormat() const {

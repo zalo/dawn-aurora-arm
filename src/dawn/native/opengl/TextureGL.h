@@ -29,6 +29,7 @@
 #define SRC_DAWN_NATIVE_OPENGL_TEXTUREGL_H_
 
 #include "src/dawn/native/Texture.h"
+#include "src/dawn/native/opengl/FramebufferCacheGL.h"
 #include "src/dawn/native/opengl/opengl_platform.h"
 
 namespace dawn::native::opengl {
@@ -90,6 +91,8 @@ class TextureView final : public TextureViewBase {
     GLuint GetTextureHandle() const;
     GLuint GetRenderbufferHandle() const;
     GLenum GetGLTarget() const;
+    // What BindToFramebuffer attaches for this view (and depth slice, for 3D textures).
+    FramebufferAttachment GetFramebufferAttachment(GLuint depthSlice = 0) const;
     MaybeError BindToFramebuffer(const OpenGLFunctions& gl,
                                  GLenum target,
                                  GLenum attachment,

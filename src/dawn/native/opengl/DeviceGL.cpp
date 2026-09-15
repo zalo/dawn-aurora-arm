@@ -247,6 +247,10 @@ MaybeError Device::Initialize(const UnpackedPtr<DeviceDescriptor>& descriptor) {
     return scopedCurrentContext.End();
 }
 
+FramebufferCache* Device::GetFramebufferCache() {
+    return &mFramebufferCache;
+}
+
 const GLFormat& Device::GetGLFormat(const Format& format) {
     DAWN_ASSERT(format.IsSupported());
     DAWN_ASSERT(format.GetIndex() < mFormatTable.size());
@@ -537,6 +541,13 @@ void Device::DestroyImpl(DestroyReason reason) {
 
     mTextureBuiltinsBuffer = nullptr;
     mArrayLengthBuffer = nullptr;
+
+    // Framebuffer objects belong to the context, which is still alive here.
+    IgnoreErrors(ExecuteGL(ExecutionQueueBase::SubmitMode::Passive,
+                           [this](const OpenGLFunctions& gl) -> MaybeError {
+                               mFramebufferCache.Clear(gl);
+                               return {};
+                           }));
 }
 
 void Device::MarkGLUsed(ExecutionQueueBase::SubmitMode submitMode) const {

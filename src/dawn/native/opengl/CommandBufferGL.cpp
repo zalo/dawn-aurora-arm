@@ -46,6 +46,7 @@
 #include "src/dawn/native/opengl/ComputePipelineGL.h"
 #include "src/dawn/native/opengl/DeviceGL.h"
 #include "src/dawn/native/opengl/Forward.h"
+#include "src/dawn/native/opengl/FramebufferCacheGL.h"
 #include "src/dawn/native/opengl/ImmediatesLayoutGL.h"
 #include "src/dawn/native/opengl/PersistentPipelineStateGL.h"
 #include "src/dawn/native/opengl/PhysicalDeviceGL.h"
@@ -1320,16 +1321,34 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
     const IndirectDrawMetadata& metadata = GetIndirectDrawMetadata()[renderPassIndex];
     IndirectDrawIndex indirectDrawIndex{0u};
 
-    // Create the framebuffer used for this render pass and calls the correct glDrawBuffers
-    {
-        // TODO(kainino@chromium.org): This is added to possibly work around an issue seen on
-        // Windows/Intel. It should break any feedback loop before the clears, even if there
-        // shouldn't be any negative effects from this. Investigate whether it's actually
-        // needed.
-        DAWN_GL_TRY(gl, BindFramebuffer(GL_READ_FRAMEBUFFER, 0));
-        // TODO(kainino@chromium.org): possible future optimization: create these framebuffers
-        // at Framebuffer build time (or maybe CommandBuffer build time) so they don't have to
-        // be created and destroyed at draw time.
+    // Bind the framebuffer for this render pass. Framebuffers are cached by attachment set on the
+    // device, so one is only built and validated the first time a set of attachments is rendered
+    // into; framebuffer completeness validation is expensive on tile-based mobile drivers.
+    FramebufferCache* framebufferCache = ToBackend(GetDevice())->GetFramebufferCache();
+    FramebufferKey framebufferKey;
+    for (auto i : renderPass->attachmentState->GetColorAttachmentsMask()) {
+        TextureView* textureView = ToBackend(renderPass->colorAttachments[i].view.Get());
+        framebufferKey.colors[i] =
+            textureView->GetFramebufferAttachment(renderPass->colorAttachments[i].depthSlice);
+    }
+    if (renderPass->attachmentState->HasDepthStencilAttachment()) {
+        TextureView* textureView = ToBackend(renderPass->depthStencilAttachment.view.Get());
+        framebufferKey.depthStencil = textureView->GetFramebufferAttachment();
+        framebufferKey.depthStencilAttachmentPoint =
+            DepthStencilAttachmentPoint(textureView->GetTexture()->GetFormat());
+    }
+    framebufferKey.sampleCount = renderPass->attachmentState->GetSampleCount();
+
+    // TODO(kainino@chromium.org): This is added to possibly work around an issue seen on
+    // Windows/Intel. It should break any feedback loop before the clears, even if there
+    // shouldn't be any negative effects from this. Investigate whether it's actually
+    // needed.
+    DAWN_GL_TRY(gl, BindFramebuffer(GL_READ_FRAMEBUFFER, 0));
+
+    fbo = framebufferCache->Find(framebufferKey);
+    if (fbo != 0) {
+        DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
+    } else {
         DAWN_GL_TRY(gl, GenFramebuffers(1, &fbo));
         DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
 
@@ -1355,17 +1374,16 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
 
         if (renderPass->attachmentState->HasDepthStencilAttachment()) {
             TextureView* textureView = ToBackend(renderPass->depthStencilAttachment.view.Get());
-            const Format& format = textureView->GetTexture()->GetFormat();
 
             // Attach depth/stencil buffer.
-            GLenum glAttachment = DepthStencilAttachmentPoint(format);
-
-            DAWN_TRY(textureView->BindToFramebuffer(gl, GL_DRAW_FRAMEBUFFER, glAttachment, 0,
+            DAWN_TRY(textureView->BindToFramebuffer(gl, GL_DRAW_FRAMEBUFFER,
+                                                    framebufferKey.depthStencilAttachmentPoint, 0,
                                                     renderPass->attachmentState->GetSampleCount()));
         }
-    }
 
-    DAWN_TRY(CheckFramebufferComplete(gl, GL_DRAW_FRAMEBUFFER));
+        DAWN_TRY(CheckFramebufferComplete(gl, GL_DRAW_FRAMEBUFFER));
+        framebufferCache->Insert(gl, framebufferKey, fbo);
+    }
 
     // Set defaults for dynamic state before executing clears and commands.
     PersistentPipelineState persistentPipelineState;
@@ -1653,7 +1671,8 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
                                         checked_cast<GLsizei>(attachmentsToDiscard.size()),
                                         attachmentsToDiscard.data()));
                 }
-                DAWN_GL_TRY(gl, DeleteFramebuffers(1, &fbo));
+                // The framebuffer stays in the device's cache for the next pass over these
+                // attachments.
                 return {};
             }
 

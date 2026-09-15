@@ -42,6 +42,7 @@
 #include "src/dawn/native/opengl/ContextEGL.h"
 #include "src/dawn/native/opengl/EGLFunctions.h"
 #include "src/dawn/native/opengl/Forward.h"
+#include "src/dawn/native/opengl/FramebufferCacheGL.h"
 #include "src/dawn/native/opengl/GLFormat.h"
 #include "src/dawn/native/opengl/OpenGLFunctions.h"
 #include "src/utils/compiler.h"
@@ -236,6 +237,10 @@ class Device final : public DeviceBase {
 
     const GLFormat& GetGLFormat(const Format& format);
 
+    // Complete framebuffer objects reused by render passes over the same attachments. Only to be
+    // used while the device's GL context is current.
+    FramebufferCache* GetFramebufferCache();
+
     float GetMaxTextureMaxAnisotropy() const;
 
     MaybeError ValidateTextureCanBeWrapped(const UnpackedPtr<TextureDescriptor>& descriptor);
@@ -332,6 +337,7 @@ class Device final : public DeviceBase {
     MutexProtected<std::vector<GLWorkFunc>> mPendingGLWorkList;
 
     GLFormatTable mFormatTable;
+    FramebufferCache mFramebufferCache;
     std::unique_ptr<ContextEGL> mContext;
     std::unique_ptr<ContextEGL> mPipelineContext;
     float mMaxTextureMaxAnisotropy = 0;
