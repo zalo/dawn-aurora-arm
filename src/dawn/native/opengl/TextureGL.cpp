@@ -354,8 +354,22 @@ bool Texture::IsRenderbuffer() const {
            GetFormat().HasDepthOrStencil();
 }
 
+GLuint Texture::DetachHandle() {
+    DAWN_ASSERT(mOwnsHandle == OwnsHandle::Yes && !IsRenderbuffer());
+    if (IsDestroyed()) {
+        return 0;
+    }
+    mOwnsHandle = OwnsHandle::No;
+    mHandleDetached = true;
+    return mTextureHandle;
+}
+
 void Texture::DestroyImpl(DestroyReason reason) {
     TextureBase::DestroyImpl(reason);
+    if (mHandleDetached) {
+        // The GL texture now belongs to the swapchain.
+        return;
+    }
     if (mOwnsHandle == OwnsHandle::Yes) {
         if (IsRenderbuffer()) {
             IgnoreErrors(ToBackend(GetDevice())

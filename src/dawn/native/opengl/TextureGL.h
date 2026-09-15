@@ -61,6 +61,13 @@ class Texture final : public TextureBase {
     GLenum GetGLTarget() const;
     const GLFormat& GetGLFormat() const;
 
+    // Hands the GL texture over to the caller, which keeps it alive and unchanged beyond this
+    // Texture: it is no longer deleted when the Texture is destroyed and the framebuffers cached
+    // against it are kept. Returns 0 if the Texture was already destroyed, in which case the GL
+    // texture is being deleted. The swapchain uses this to reuse the storage of the presented
+    // texture for the next frame's texture.
+    GLuint DetachHandle();
+
     MaybeError EnsureSubresourceContentInitialized(const OpenGLFunctions& gl,
                                                    const SubresourceRange& range);
 
@@ -78,6 +85,7 @@ class Texture final : public TextureBase {
     GLuint mTextureHandle;
     GLuint mRenderbufferHandle;
     OwnsHandle mOwnsHandle = OwnsHandle::No;
+    bool mHandleDetached = false;
     GLenum mTarget;
 };
 
