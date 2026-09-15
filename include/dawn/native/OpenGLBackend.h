@@ -37,6 +37,7 @@ using EGLDisplay = void*;
 using EGLImage = void*;
 using GLuint = unsigned int;
 using EGLint = int32_t;
+using GLenum = unsigned int;
 
 // Define a GetProc function pointer that mirrors the one in egl.h
 #if defined(_WIN32)
@@ -83,6 +84,79 @@ struct DAWN_NATIVE_EXPORT ExternalImageDescriptorGLTexture : ExternalImageDescri
 
 DAWN_NATIVE_EXPORT WGPUTexture
 WrapExternalGLTexture(WGPUDevice device, const ExternalImageDescriptorGLTexture* descriptor);
+
+// Native OpenGL interop. An application that keeps Dawn's resource ownership, upload
+// scheduling and render pass setup can still issue the GL calls of a render pass itself,
+// in the device's GL context, and can look up the GL names behind WebGPU objects to do so.
+// Intended for draw-call-bound GLES devices (Mali, Adreno, VideoCore) where the per-draw
+// cost of the WebGPU command executor dominates.
+
+// Runs `callback` on the device's GL context with the context current, after every
+// previously enqueued GL work of the device. Returns false when the device is lost.
+using GLInteropCallback = void (*)(void* userdata);
+DAWN_NATIVE_EXPORT bool RunGLInterop(WGPUDevice device, GLInteropCallback callback, void* userdata);
+
+// Application-owned presenter running in a context that shares the device's share group.
+// `submit` takes ownership of a GL_TEXTURE_2D name holding the frame (current context's share
+// group) and returns true when it will present and later delete it; it must fence the
+// device's context before returning. `acquire` (optional) hands back a previously submitted
+// texture of this size whose presentation completed, or 0; the swapchain wraps it instead of
+// allocating new storage. `shutdown` drains queued presentations before the EGL surface is
+// destroyed.
+struct GLInteropPresentCallbacks {
+    bool (*submit)(GLuint texture, uint32_t width, uint32_t height, void* eglSurface);
+    void (*shutdown)();
+    GLuint (*acquire)(uint32_t width, uint32_t height);
+};
+DAWN_NATIVE_EXPORT void SetGLInteropPresentCallbacks(const GLInteropPresentCallbacks* callbacks);
+DAWN_NATIVE_EXPORT const GLInteropPresentCallbacks* GetGLInteropPresentCallbacks();
+
+struct DAWN_NATIVE_EXPORT GLInteropTextureInfo {
+    GLuint texture;
+    GLuint renderbuffer;
+    GLenum target;
+    uint32_t baseMipLevel;
+    uint32_t maxMipLevel;
+    GLenum swizzle[4];
+};
+struct DAWN_NATIVE_EXPORT GLInteropPipelineInfo {
+    GLuint program;
+    GLuint vertexArray;
+    GLenum topology;
+};
+DAWN_NATIVE_EXPORT GLuint GetGLInteropBuffer(WGPUBuffer buffer);
+DAWN_NATIVE_EXPORT GLuint GetGLInteropSampler(WGPUSampler sampler);
+DAWN_NATIVE_EXPORT GLInteropTextureInfo GetGLInteropTextureView(WGPUTextureView view);
+DAWN_NATIVE_EXPORT GLInteropTextureInfo GetGLInteropBindGroupTexture(WGPUBindGroup group,
+                                                                     uint32_t binding);
+DAWN_NATIVE_EXPORT GLuint GetGLInteropBindGroupSampler(WGPUBindGroup group, uint32_t binding);
+DAWN_NATIVE_EXPORT GLInteropPipelineInfo GetGLInteropRenderPipeline(WGPURenderPipeline pipeline);
+// Texture units the pipeline's program samples binding (group, binding) through; `sampler`
+// selects the sampler half of a texture/sampler pair. Returns the total count.
+DAWN_NATIVE_EXPORT uint32_t GetGLInteropTextureUnits(WGPURenderPipeline pipeline,
+                                                     uint32_t group,
+                                                     uint32_t binding,
+                                                     bool sampler,
+                                                     uint32_t* units,
+                                                     uint32_t capacity);
+// GL uniform/storage block binding index of buffer binding (group, binding), UINT32_MAX if none.
+DAWN_NATIVE_EXPORT uint32_t GetGLInteropBufferBinding(WGPURenderPipeline pipeline,
+                                                      uint32_t group,
+                                                      uint32_t binding);
+// Drains the GL texture/renderbuffer names destroyed since the last call (tracked once any
+// interop callback has been installed; any thread may destroy, call from one thread). Lets the
+// application drop caches keyed by GL name before the name is recycled. No GL calls are made.
+DAWN_NATIVE_EXPORT uint32_t GetGLInteropDestroyedTextures(WGPUDevice device,
+                                                          GLuint* out,
+                                                          uint32_t maxCount);
+
+// When installed, the callback runs after the command executor has bound and cleared a render
+// pass's framebuffer and set the default dynamic state. Returning true means the callback
+// rendered the pass; its recorded WebGPU commands are then skipped up to EndRenderPass.
+using GLInteropRenderPassCallback = bool (*)(void* userdata, uint32_t passIndex, const char* label);
+DAWN_NATIVE_EXPORT void SetGLInteropRenderPassCallback(GLInteropRenderPassCallback callback,
+                                                       void* userdata);
+DAWN_NATIVE_EXPORT bool TryGLInteropRenderPass(uint32_t passIndex, const char* label);
 
 }  // namespace dawn::native::opengl
 

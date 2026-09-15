@@ -690,6 +690,25 @@ static constexpr ToggleEnumAndInfoList kToggleNameAndInfoList = {{
       "Compat spec, which for OpenGLES is version 3.1 with no extensions. This toggle is used by "
       "end2end testing.",
       "crbug.com/382084196", ToggleStage::Adapter}},
+    {Toggle::GLCacheFramebuffers,
+     {"gl_cache_framebuffers",
+      "Cache the framebuffer objects of render passes in the OpenGL backend by attachment "
+      "identity instead of creating and deleting one per render pass. Entries are dropped when "
+      "an attached texture is destroyed. Intended for use together with the native GL interop "
+      "render pass callback on tile-based mobile drivers, where framebuffer completeness "
+      "validation is expensive; it can regress drivers that block on framebuffer reuse.",
+      "https://github.com/encounter/dawn", ToggleStage::Device}},
+    {Toggle::GLInteropTiming,
+     {"gl_interop_timing",
+      "Print per-command-type and per-render-pass wall time of command buffer execution and "
+      "queue submission to stderr every 120 submits. Diagnostic for the native GL interop path.",
+      "https://github.com/encounter/dawn", ToggleStage::Device}},
+    {Toggle::GLMapFullBufferWrites,
+     {"gl_map_full_buffer_writes",
+      "Perform queue writes that replace a whole buffer through a write-only, invalidating "
+      "glMapBufferRange instead of glBufferSubData, letting the driver discard the previous "
+      "storage instead of waiting for in-flight reads of it.",
+      "https://github.com/encounter/dawn", ToggleStage::Device}},
     {Toggle::VulkanMonolithicPipelineCache,
      {"vulkan_monolithic_pipeline_cache",
       "Use a monolithic VkPipelineCache per device. The embedder is responsible for calling "

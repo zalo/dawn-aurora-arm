@@ -364,11 +364,20 @@ GLuint Texture::DetachHandle() {
     return mTextureHandle;
 }
 
+// CommandBufferGL.cpp: cached framebuffers must not outlive their attachments.
+void GLInteropForgetFramebuffers(GLuint handle);
+
 void Texture::DestroyImpl(DestroyReason reason) {
     TextureBase::DestroyImpl(reason);
     if (mHandleDetached) {
-        // The GL texture now belongs to the swapchain.
+        // The GL texture now belongs to the swapchain (or to the interop presenter, which
+        // keeps its cached framebuffers valid by pooling the name).
         return;
+    }
+    if (mOwnsHandle == OwnsHandle::Yes) {
+        // May run on any thread: only record the names, the render thread purges its caches.
+        GLInteropForgetFramebuffers(mTextureHandle);
+        GLInteropForgetFramebuffers(mRenderbufferHandle);
     }
     if (mOwnsHandle == OwnsHandle::Yes) {
         if (IsRenderbuffer()) {

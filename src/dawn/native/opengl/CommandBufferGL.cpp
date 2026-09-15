@@ -28,10 +28,18 @@
 #include "src/dawn/native/opengl/CommandBufferGL.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "dawn/native/OpenGLBackend.h"
 #include "partition_alloc/pointers/raw_ptr.h"
 #include "src/dawn/common/MatchVariant.h"
 #include "src/dawn/common/Range.h"
@@ -836,8 +844,55 @@ MaybeError CommandBuffer::Execute(const OpenGLFunctions& gl) {
     PassIndex nextComputePassNumber{0u};
     PassIndex nextRenderPassNumber{0u};
 
+    // gl_interop_timing: per-command-type wall time, summarized every 120 submits.
+    const bool timing = ToBackend(GetDevice())->IsToggleEnabled(Toggle::GLInteropTiming);
+    static double sCommandMs[32] = {};
+    static uint64_t sCommandCount[32] = {};
+    static uint64_t sSubmits = 0;
+    std::chrono::steady_clock::time_point commandStart;
+    auto accountCommand = [&](Command t) {
+        if (!timing) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const unsigned i = std::min<unsigned>(static_cast<unsigned>(t), 31);
+        sCommandMs[i] += std::chrono::duration<double, std::milli>(now - commandStart).count();
+        sCommandCount[i]++;
+        commandStart = now;
+    };
+    if (timing) {
+        commandStart = std::chrono::steady_clock::now();
+    }
+    struct TimingReport {
+        bool enabled;
+        ~TimingReport() {
+            if (!enabled || ++sSubmits % 120) {
+                return;
+            }
+            fprintf(stderr, "[gl-interop-exec] submits=120");
+            for (unsigned i = 0; i < 32; ++i) {
+                if (sCommandCount[i]) {
+                    fprintf(stderr, " cmd%u=%.3fms/%llu", i, sCommandMs[i] / 120.0,
+                            static_cast<unsigned long long>(sCommandCount[i] / 120));
+                }
+            }
+            fprintf(stderr, "\n");
+            for (auto& v : sCommandMs) {
+                v = 0;
+            }
+            for (auto& c : sCommandCount) {
+                c = 0;
+            }
+        }
+    } timingReport{timing};
+
     Command type;
     while (mCommands.NextCommandId(&type)) {
+        struct CommandScope {
+            Command t;
+            decltype(accountCommand)& f;
+            ~CommandScope() { f(t); }
+        } commandScope{type, accountCommand};
         switch (type) {
             case Command::BeginComputePass: {
                 mCommands.NextCommand<BeginComputePassCmd>();
@@ -857,6 +912,32 @@ MaybeError CommandBuffer::Execute(const OpenGLFunctions& gl) {
 
             case Command::BeginRenderPass: {
                 auto* cmd = mCommands.NextCommand<BeginRenderPassCmd>();
+                struct PassTimer {
+                    bool enabled;
+                    const char* label;
+                    std::chrono::steady_clock::time_point start;
+                    ~PassTimer() {
+                        if (!enabled) {
+                            return;
+                        }
+                        static std::map<std::string, std::pair<double, uint64_t>> sPasses;
+                        static uint64_t sCount = 0;
+                        auto& e = sPasses[label];
+                        e.first += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count();
+                        e.second++;
+                        if (++sCount % 840 == 0) {
+                            fprintf(stderr, "[gl-interop-pass]");
+                            for (auto& [k, v] : sPasses) {
+                                fprintf(stderr, " \"%s\"=%.3fms/%llu", k.c_str(), v.first / 120.0,
+                                        static_cast<unsigned long long>(v.second));
+                            }
+                            fprintf(stderr, " (per 120 submits)\n");
+                            sPasses.clear();
+                        }
+                    }
+                } passTimer{timing, cmd->label.c_str(), std::chrono::steady_clock::now()};
                 for (TextureBase* texture :
                      this->GetResourceUsages().renderPasses[nextRenderPassNumber].textures) {
                     DAWN_TRY(ToBackend(texture)->SynchronizeTextureBeforeUse());
@@ -1312,6 +1393,88 @@ MaybeError CommandBuffer::ExecuteComputePass(const OpenGLFunctions& gl) {
     DAWN_UNREACHABLE();
 }
 
+// gl_cache_framebuffers: framebuffer objects cached by attachment identity. On tile-based
+// mobile drivers completeness validation and FBO churn are expensive, and passes over the same
+// targets recur every frame. Entries are forgotten when an attached texture is destroyed.
+namespace {
+struct CachedFramebuffer {
+    GLuint fbo;
+    std::vector<GLuint> handles;
+};
+std::unordered_map<uint64_t, CachedFramebuffer>& FramebufferCache() {
+    static std::unordered_map<uint64_t, CachedFramebuffer> cache;
+    return cache;
+}
+// Texture::DestroyImpl may run on any thread: names are queued and consumed by two readers.
+// The render pass purges its framebuffer cache with GL access; the application drains names
+// for its own caches (GetGLInteropDestroyedTextures) without touching GL, once it has
+// installed an interop callback.
+std::mutex& ForgetMutex() {
+    static std::mutex m;
+    return m;
+}
+std::vector<GLuint>& ForgetListFramebuffers() {
+    static std::vector<GLuint> list;
+    return list;
+}
+std::vector<GLuint>& ForgetListExternal() {
+    static std::vector<GLuint> list;
+    return list;
+}
+std::atomic<bool> gTrackDestroyedTextures{false};
+}  // namespace
+
+void GLInteropSetTrackDestroyedTextures(bool track) {
+    gTrackDestroyedTextures.store(track, std::memory_order_release);
+}
+
+void GLInteropForgetFramebuffers(GLuint handle) {
+    if (!handle) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ForgetMutex());
+    ForgetListFramebuffers().push_back(handle);
+    if (gTrackDestroyedTextures.load(std::memory_order_acquire)) {
+        ForgetListExternal().push_back(handle);
+    }
+}
+
+std::vector<GLuint> GLInteropDrainDestroyedTextures() {
+    std::lock_guard<std::mutex> lock(ForgetMutex());
+    std::vector<GLuint> handles;
+    handles.swap(ForgetListExternal());
+    return handles;
+}
+
+namespace {
+// Render thread, context current: drop cached framebuffers referencing dead objects.
+void PurgeFramebufferCache(const OpenGLFunctions& gl) {
+    std::vector<GLuint> handles;
+    {
+        std::lock_guard<std::mutex> lock(ForgetMutex());
+        handles.swap(ForgetListFramebuffers());
+    }
+    if (handles.empty()) {
+        return;
+    }
+    auto& cache = FramebufferCache();
+    for (auto it = cache.begin(); it != cache.end();) {
+        bool hit = false;
+        for (GLuint h : it->second.handles) {
+            for (GLuint dead : handles) {
+                hit |= h == dead;
+            }
+        }
+        if (hit) {
+            gl.DeleteFramebuffers(1, &it->second.fbo);
+            it = cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+}  // namespace
+
 MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
                                             const OpenGLFunctions& gl,
                                             PassIndex renderPassIndex) {
@@ -1320,8 +1483,58 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
     const IndirectDrawMetadata& metadata = GetIndirectDrawMetadata()[renderPassIndex];
     IndirectDrawIndex indirectDrawIndex{0u};
 
+    const bool cacheFramebuffers =
+        ToBackend(GetDevice())->IsToggleEnabled(Toggle::GLCacheFramebuffers);
+    // Also keeps the pending list from growing when caching is off.
+    PurgeFramebufferCache(gl);
+    bool fboCached = false;
+    uint64_t fboKey = 1469598103934665603ull;
+    std::vector<GLuint> fboHandles;
+    if (cacheFramebuffers) {
+        auto mix = [&](uint64_t v) {
+            fboKey ^= v;
+            fboKey *= 1099511628211ull;
+        };
+        for (auto i : renderPass->attachmentState->GetColorAttachmentsMask()) {
+            TextureView* view = ToBackend(renderPass->colorAttachments[i].view.Get());
+            Texture* tex = ToBackend(view->GetTexture());
+            mix(static_cast<uint8_t>(i));
+            mix(tex->GetTextureHandle());
+            mix(tex->GetRenderbufferHandle());
+            mix(view->GetTextureHandle());
+            mix(view->GetBaseMipLevel());
+            mix(view->GetBaseArrayLayer());
+            mix(renderPass->colorAttachments[i].depthSlice);
+            fboHandles.push_back(tex->GetTextureHandle());
+            fboHandles.push_back(tex->GetRenderbufferHandle());
+            fboHandles.push_back(view->GetTextureHandle());
+        }
+        if (renderPass->attachmentState->HasDepthStencilAttachment()) {
+            TextureView* view = ToBackend(renderPass->depthStencilAttachment.view.Get());
+            Texture* tex = ToBackend(view->GetTexture());
+            mix(0xD5);
+            mix(tex->GetTextureHandle());
+            mix(tex->GetRenderbufferHandle());
+            mix(view->GetTextureHandle());
+            mix(view->GetBaseMipLevel());
+            mix(view->GetBaseArrayLayer());
+            fboHandles.push_back(tex->GetTextureHandle());
+            fboHandles.push_back(tex->GetRenderbufferHandle());
+            fboHandles.push_back(view->GetTextureHandle());
+        }
+        mix(renderPass->attachmentState->GetSampleCount());
+        auto& cache = FramebufferCache();
+        if (auto it = cache.find(fboKey); it != cache.end()) {
+            fbo = it->second.fbo;
+            fboCached = true;
+        }
+    }
+
     // Create the framebuffer used for this render pass and calls the correct glDrawBuffers
-    {
+    if (fboCached) {
+        DAWN_GL_TRY(gl, BindFramebuffer(GL_READ_FRAMEBUFFER, 0));
+        DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
+    } else {
         // TODO(kainino@chromium.org): This is added to possibly work around an issue seen on
         // Windows/Intel. It should break any feedback loop before the clears, even if there
         // shouldn't be any negative effects from this. Investigate whether it's actually
@@ -1365,7 +1578,12 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
         }
     }
 
-    DAWN_TRY(CheckFramebufferComplete(gl, GL_DRAW_FRAMEBUFFER));
+    if (!fboCached) {
+        DAWN_TRY(CheckFramebufferComplete(gl, GL_DRAW_FRAMEBUFFER));
+        if (cacheFramebuffers) {
+            FramebufferCache().emplace(fboKey, CachedFramebuffer{fbo, std::move(fboHandles)});
+        }
+    }
 
     // Set defaults for dynamic state before executing clears and commands.
     PersistentPipelineState persistentPipelineState;
@@ -1611,8 +1829,16 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
         return {};
     };
 
+    // Native GL interop: the application may render this pass itself now that the framebuffer
+    // is bound, cleared and the dynamic state is at its defaults.
+    const bool interopRenderPass =
+        TryGLInteropRenderPass(static_cast<uint32_t>(renderPassIndex), renderPass->label.c_str());
     Command type;
     while (mCommands.NextCommandId(&type)) {
+        if (interopRenderPass && type != Command::EndRenderPass) {
+            SkipCommand(&mCommands, type);
+            continue;
+        }
         switch (type) {
             case Command::EndRenderPass: {
                 mCommands.NextCommand<EndRenderPassCmd>();
@@ -1653,7 +1879,9 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
                                         checked_cast<GLsizei>(attachmentsToDiscard.size()),
                                         attachmentsToDiscard.data()));
                 }
-                DAWN_GL_TRY(gl, DeleteFramebuffers(1, &fbo));
+                if (!cacheFramebuffers) {
+                    DAWN_GL_TRY(gl, DeleteFramebuffers(1, &fbo));
+                }
                 return {};
             }
 

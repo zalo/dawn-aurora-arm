@@ -29,6 +29,7 @@
 
 #include <utility>
 
+#include "dawn/native/OpenGLBackend.h"
 #include "src/dawn/native/ChainUtils.h"
 #include "src/dawn/native/Surface.h"
 #include "src/dawn/native/opengl/ContextEGL.h"
@@ -116,6 +117,25 @@ MaybeError SwapChainEGL::PresentImpl() {
     EGLDisplay display = device->GetEGLDisplay();
     const EGLFunctions& egl = device->GetEGL(false);
 
+    if (const auto* presenter = GetGLInteropPresentCallbacks()) {
+        // The presenter fences this context and assumes ownership of the GL name. The WebGPU
+        // surface texture is still destroyed at Present(), while the native name lives until
+        // the presenter's context has finished with it (and may come back through acquire()).
+        ContextEGL::ScopedMakeCurrent current;
+        DAWN_TRY_ASSIGN(current, device->GetContext()->MakeCurrent());
+        const bool submitted =
+            presenter->submit(mTexture->GetTextureHandle(), mTexture->GetWidth(Aspect::Color),
+                              mTexture->GetHeight(Aspect::Color), mEGLSurface);
+        DAWN_TRY(current.End());
+        if (submitted) {
+            mTexture->DetachHandle();
+            mTexture->APIDestroy();
+            mTexture = nullptr;
+            mTextureView = nullptr;
+            return {};
+        }
+    }
+
     // Do the reverse-Y blit from the fake surface texture to the default framebuffer.
     {
         auto surfaceCurrent = device->GetContext()->SetCurrentSurfaceScope(mEGLSurface);
@@ -172,7 +192,17 @@ ResultOrError<SwapChainTextureInfo> SwapChainEGL::GetCurrentTextureImpl() {
     mCurrentBackingTexture = mNextBackingTexture;
     mNextBackingTexture = (mNextBackingTexture + 1) % kBackingTextureCount;
     GLuint& backingTexture = mBackingTextures[mCurrentBackingTexture];
-    if (backingTexture != 0) {
+    // With an interop presenter the presented names live in its pool instead of the ring: a
+    // texture whose presentation completed is wrapped again rather than allocated anew.
+    GLuint recycled = 0;
+    if (const auto* presenter = GetGLInteropPresentCallbacks();
+        presenter != nullptr && presenter->acquire != nullptr) {
+        recycled = presenter->acquire(desc.size.width, desc.size.height);
+    }
+    if (recycled != 0) {
+        texture = AcquireRef(
+            new Texture(ToBackend(GetDevice()), Unpack(&desc), recycled, OwnsHandle::Yes));
+    } else if (backingTexture != 0) {
         texture = AcquireRef(
             new Texture(ToBackend(GetDevice()), Unpack(&desc), backingTexture, OwnsHandle::Yes));
         backingTexture = 0;
@@ -192,6 +222,10 @@ ResultOrError<SwapChainTextureInfo> SwapChainEGL::GetCurrentTextureImpl() {
 }
 
 void SwapChainEGL::DetachFromSurfaceImpl() {
+    if (const auto* presenter = GetGLInteropPresentCallbacks()) {
+        // Queued presentations reference the EGL surface destroyed below.
+        presenter->shutdown();
+    }
     if (mEGLSurface != EGL_NO_SURFACE) {
         Device* device = ToBackend(GetDevice());
         device->GetEGL(false).DestroySurface(device->GetEGLDisplay(), mEGLSurface);

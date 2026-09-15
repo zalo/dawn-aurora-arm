@@ -27,6 +27,9 @@
 
 #include "src/dawn/native/opengl/QueueGL.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "dawn/platform/DawnPlatform.h"
@@ -80,14 +83,38 @@ Queue::Queue(Device* device, const QueueDescriptor* descriptor) : QueueBase(devi
 
 MaybeError Queue::SubmitImpl(Span<CommandBufferBase* const> commands) {
     Device* device = ToBackend(GetDevice());
-    return device->EnqueueAndFlushGL([this, commands](const OpenGLFunctions& gl) -> MaybeError {
-        TRACE_EVENT_BEGIN0(GetDevice()->GetPlatform(), Recording, "CommandBufferGL::Execute");
-        for (CommandBufferBase* commandBuffer : commands) {
-            DAWN_TRY(ToBackend(commandBuffer)->Execute(gl));
+    // gl_interop_timing: time spent executing commands versus the rest of the submit.
+    const bool timing = device->IsToggleEnabled(Toggle::GLInteropTiming);
+    static double sExecuteMs = 0, sTotalMs = 0;
+    static unsigned sSubmits = 0;
+    const auto submitStart = std::chrono::steady_clock::now();
+    MaybeError result = device->EnqueueAndFlushGL(
+        [this, commands, timing](const OpenGLFunctions& gl) -> MaybeError {
+            const auto executeStart = std::chrono::steady_clock::now();
+            TRACE_EVENT_BEGIN0(GetDevice()->GetPlatform(), Recording, "CommandBufferGL::Execute");
+            for (CommandBufferBase* commandBuffer : commands) {
+                DAWN_TRY(ToBackend(commandBuffer)->Execute(gl));
+            }
+            TRACE_EVENT_END0(GetDevice()->GetPlatform(), Recording, "CommandBufferGL::Execute");
+            if (timing) {
+                sExecuteMs += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - executeStart)
+                                  .count();
+            }
+            return {};
+        });
+    if (timing) {
+        sTotalMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              submitStart)
+                        .count();
+        if (++sSubmits % 120 == 0) {
+            fprintf(stderr,
+                    "[gl-interop-submit] execute_ms=%.3f other_ms=%.3f (per submit, 120 submits)\n",
+                    sExecuteMs / 120, (sTotalMs - sExecuteMs) / 120);
+            sExecuteMs = sTotalMs = 0;
         }
-        TRACE_EVENT_END0(GetDevice()->GetPlatform(), Recording, "CommandBufferGL::Execute");
-        return {};
-    });
+    }
+    return result;
 }
 
 MaybeError Queue::WriteBufferImpl(BufferBase* buffer,
@@ -95,11 +122,29 @@ MaybeError Queue::WriteBufferImpl(BufferBase* buffer,
                                   Span<const std::byte> data) {
     DAWN_TRY(ToBackend(buffer)->EnsureDataInitializedAsDestination(bufferOffset, data.size()));
     buffer->MarkUsedInPendingCommands();
+    const bool mapFullWrites = GetDevice()->IsToggleEnabled(Toggle::GLMapFullBufferWrites);
     return ToBackend(GetDevice())
         ->EnqueueGL(data,
-                    [buffer = Ref<Buffer>(ToBackend(buffer)), bufferOffset](
+                    [buffer = Ref<Buffer>(ToBackend(buffer)), bufferOffset, mapFullWrites](
                         const OpenGLFunctions& gl, Span<const std::byte> data) -> MaybeError {
                         DAWN_GL_TRY(gl, BindBuffer(GL_ARRAY_BUFFER, buffer->GetHandle()));
+                        // gl_map_full_buffer_writes: a write replacing the whole buffer may
+                        // discard the previous storage. Partial writes stay on BufferSubData,
+                        // since invalidating their buffer would destroy still-live contents.
+                        // No UNSYNCHRONIZED mapping; the driver owns the hazards.
+                        if (mapFullWrites && bufferOffset == 0 && !data.empty() &&
+                            data.size() == buffer->GetAllocatedSize()) {
+                            void* mapped = DAWN_GL_TRY_ALWAYS_CHECK(
+                                gl, MapBufferRange(
+                                        GL_ARRAY_BUFFER, 0, checked_cast<GLsizeiptr>(data.size()),
+                                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT));
+                            DAWN_INVALID_IF(mapped == nullptr, "Full buffer write mapping failed");
+                            std::memcpy(mapped, data.data(), data.size());
+                            GLboolean valid =
+                                DAWN_GL_TRY_ALWAYS_CHECK(gl, UnmapBuffer(GL_ARRAY_BUFFER));
+                            DAWN_INVALID_IF(valid != GL_TRUE, "Full buffer write mapping was lost");
+                            return {};
+                        }
                         DAWN_GL_TRY(
                             gl, BufferSubData(GL_ARRAY_BUFFER, checked_cast<GLintptr>(bufferOffset),
                                               checked_cast<GLsizeiptr>(data.size()), data.data()));
